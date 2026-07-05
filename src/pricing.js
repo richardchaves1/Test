@@ -26,6 +26,48 @@ function parseHHMM(s) {
   return (h * 60) + (m || 0);
 }
 
+/** Wall-clock offset of a timezone at a given UTC instant, in ms. */
+function tzOffsetMs(utcMs, timeZone) {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const p = {};
+  for (const x of fmt.formatToParts(new Date(utcMs))) p[x.type] = x.value;
+  const asUtc = Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+  return asUtc - Math.floor(utcMs / 1000) * 1000;
+}
+
+/**
+ * Convert a local wall-clock date+time in a timezone to a UTC Date.
+ * (Two-pass to converge across DST boundaries.)
+ */
+function zonedTimeToUtc(dateStr, timeStr, timeZone) {
+  const [y, m, d] = String(dateStr).split('-').map(Number);
+  const [hh, mm] = String(timeStr).split(':').map(Number);
+  if (!y || !m || !d || Number.isNaN(hh) || Number.isNaN(mm)) return null;
+  const wall = Date.UTC(y, m - 1, d, hh, mm);
+  let utc = wall;
+  for (let i = 0; i < 2; i++) utc = wall - tzOffsetMs(utc, timeZone);
+  return new Date(utc);
+}
+
+/** Today's date (YYYY-MM-DD) in a timezone. */
+function localToday(timeZone) {
+  return localParts(new Date(), timeZone).date;
+}
+
+/** Add one calendar month to a YYYY-MM-DD date, clamping to the last day of the target month. */
+function addOneMonth(dateStr) {
+  const [y, m, d] = String(dateStr).split('-').map(Number);
+  const target = new Date(Date.UTC(y, m - 1 + 1, d));
+  if (target.getUTCMonth() !== (m % 12)) {
+    // day overflowed (e.g. Jan 31 → Feb): clamp to last day of the target month
+    return new Date(Date.UTC(y, m + 1, 0)).toISOString().slice(0, 10);
+  }
+  return target.toISOString().slice(0, 10);
+}
+
 // ---------- rule matching ----------
 
 function activeRulesFor(locationId) {
@@ -142,4 +184,4 @@ function money(cents) {
   return `$${(cents / 100).toFixed(2)}`;
 }
 
-module.exports = { quote, money, localParts };
+module.exports = { quote, money, localParts, zonedTimeToUtc, localToday, addOneMonth };

@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   location_id     INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
   plate           TEXT NOT NULL,
   email           TEXT NOT NULL DEFAULT '',
+  kind            TEXT NOT NULL DEFAULT 'drive_up' CHECK (kind IN ('drive_up','reservation')),
   start_ts        TEXT NOT NULL,                 -- ISO UTC
   end_ts          TEXT NOT NULL,
   hours           REAL NOT NULL,
@@ -94,7 +95,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   promo_code      TEXT,
   campaign_id     INTEGER REFERENCES campaigns(id) ON DELETE SET NULL,
   payment_method  TEXT NOT NULL DEFAULT 'card',
-  status          TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('paid','refunded','void')),
+  status          TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('pending','paid','refunded','void')),
+  stripe_session_id     TEXT,
+  stripe_payment_intent TEXT,
   pricing_notes   TEXT NOT NULL DEFAULT '',
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -102,7 +105,82 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_location ON sessions(location_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_plate ON sessions(plate);
 CREATE INDEX IF NOT EXISTS idx_sessions_end ON sessions(end_ts);
+
+CREATE TABLE IF NOT EXISTS passes (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref             TEXT NOT NULL UNIQUE,          -- pass reference, e.g. PCA-XXXXXXXX
+  location_id     INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  plate           TEXT NOT NULL,
+  holder_name     TEXT NOT NULL DEFAULT '',
+  email           TEXT NOT NULL DEFAULT '',
+  amount          INTEGER NOT NULL,              -- cents
+  starts_on       TEXT NOT NULL,                 -- YYYY-MM-DD local (inclusive)
+  ends_on         TEXT NOT NULL,                 -- YYYY-MM-DD local (exclusive)
+  status          TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('pending','paid','refunded','void')),
+  payment_method  TEXT NOT NULL DEFAULT 'card',
+  stripe_session_id     TEXT,
+  stripe_payment_intent TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_passes_location ON passes(location_id);
+CREATE INDEX IF NOT EXISTS idx_passes_plate ON passes(plate);
 `);
+
+// ---------- migrations for databases created by earlier versions ----------
+
+function migrate() {
+  const locCols = db.prepare('PRAGMA table_info(locations)').all().map((c) => c.name);
+  if (!locCols.includes('monthly_rate')) {
+    db.exec("ALTER TABLE locations ADD COLUMN monthly_rate INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // sessions gained: kind, stripe columns, and a 'pending' status. The status CHECK
+  // constraint can't be altered in place, so rebuild the table when it predates it.
+  const sessionsSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'").get()?.sql || '';
+  if (!sessionsSql.includes("'pending'")) {
+    db.exec(`
+      BEGIN;
+      ALTER TABLE sessions RENAME TO sessions_old;
+      CREATE TABLE sessions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ref             TEXT NOT NULL UNIQUE,
+        location_id     INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+        plate           TEXT NOT NULL,
+        email           TEXT NOT NULL DEFAULT '',
+        kind            TEXT NOT NULL DEFAULT 'drive_up' CHECK (kind IN ('drive_up','reservation')),
+        start_ts        TEXT NOT NULL,
+        end_ts          TEXT NOT NULL,
+        hours           REAL NOT NULL,
+        base_amount     INTEGER NOT NULL,
+        discount_amount INTEGER NOT NULL DEFAULT 0,
+        total_amount    INTEGER NOT NULL,
+        promo_code      TEXT,
+        campaign_id     INTEGER REFERENCES campaigns(id) ON DELETE SET NULL,
+        payment_method  TEXT NOT NULL DEFAULT 'card',
+        status          TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('pending','paid','refunded','void')),
+        stripe_session_id     TEXT,
+        stripe_payment_intent TEXT,
+        pricing_notes   TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO sessions (id, ref, location_id, plate, email, start_ts, end_ts, hours, base_amount,
+                            discount_amount, total_amount, promo_code, campaign_id, payment_method,
+                            status, pricing_notes, created_at)
+        SELECT id, ref, location_id, plate, email, start_ts, end_ts, hours, base_amount,
+               discount_amount, total_amount, promo_code, campaign_id, payment_method,
+               status, pricing_notes, created_at FROM sessions_old;
+      DROP TABLE sessions_old;
+      CREATE INDEX IF NOT EXISTS idx_sessions_location ON sessions(location_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_plate ON sessions(plate);
+      CREATE INDEX IF NOT EXISTS idx_sessions_end ON sessions(end_ts);
+      COMMIT;
+    `);
+    console.log('[migrate] sessions table upgraded (kind, stripe columns, pending status)');
+  }
+}
+
+migrate();
 
 // ---------- helpers ----------
 
@@ -147,14 +225,14 @@ function seed() {
   const locCount = db.prepare('SELECT COUNT(*) AS n FROM locations').get().n;
   if (locCount === 0 && process.env.PCA_SKIP_SEED !== '1') {
     const insertLoc = db.prepare(`INSERT INTO locations
-      (code, name, address, city, state, zip, description, capacity, hourly_rate, daily_max)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (code, name, address, city, state, zip, description, capacity, hourly_rate, daily_max, monthly_rate)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const loc1 = insertLoc.run(uniqueLocationCode(), 'Downtown Garage', '101 Main Street', 'Charlotte', 'NC', '28202',
-      'Covered garage, 2 blocks from the convention center. Clearance 6\'8".', 220, 400, 2800).lastInsertRowid;
+      'Covered garage, 2 blocks from the convention center. Clearance 6\'8".', 220, 400, 2800, 18000).lastInsertRowid;
     const loc2 = insertLoc.run(uniqueLocationCode(), 'Airport Economy Lot', '5500 Airport Blvd', 'Charlotte', 'NC', '28208',
-      'Open-air economy lot with free shuttle to all terminals every 10 minutes.', 600, 200, 1200).lastInsertRowid;
+      'Open-air economy lot with free shuttle to all terminals every 10 minutes.', 600, 200, 1200, 9500).lastInsertRowid;
     const loc3 = insertLoc.run(uniqueLocationCode(), 'Stadium Lot C', '800 South Mint Street', 'Charlotte', 'NC', '28203',
-      'Walking distance to the stadium. Event pricing applies on game days.', 350, 300, 2000).lastInsertRowid;
+      'Walking distance to the stadium. Event pricing applies on game days.', 350, 300, 2000, 0).lastInsertRowid;
 
     const insertRule = db.prepare(`INSERT INTO pricing_rules
       (location_id, name, rule_type, value, days_of_week, start_time, end_time, max_hours, priority)

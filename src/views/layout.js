@@ -1,5 +1,7 @@
 'use strict';
 
+const { LOGO_SVG } = require('./logo');
+
 /** Escape a value for interpolation into HTML. */
 function esc(v) {
   return String(v ?? '')
@@ -10,14 +12,7 @@ function esc(v) {
     .replaceAll("'", '&#39;');
 }
 
-const LOGO_SVG = `
-<svg class="pca-logo" viewBox="0 0 44 44" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <rect x="2" y="2" width="40" height="40" rx="8" fill="#0b2545"/>
-  <rect x="2" y="2" width="40" height="40" rx="8" fill="none" stroke="#c8102e" stroke-width="2.5"/>
-  <text x="22" y="29" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="800" font-size="17" fill="#ffffff">P</text>
-  <circle cx="31" cy="13" r="5" fill="#c8102e"/>
-  <text x="31" y="16.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="800" font-size="9.5" fill="#ffffff">$</text>
-</svg>`;
+const FAVICON = `<link rel="icon" href="data:image/svg+xml,${encodeURIComponent(LOGO_SVG)}">`;
 
 /** Admin console page shell. */
 function adminLayout({ title, active, admin, flash, body }) {
@@ -27,6 +22,7 @@ function adminLayout({ title, active, admin, flash, body }) {
     ['pricing', '/admin/pricing', 'Pricing Rules'],
     ['campaigns', '/admin/campaigns', 'Marketing'],
     ['transactions', '/admin/transactions', 'Transactions'],
+    ['passes', '/admin/passes', 'Passes'],
     ['enforcement', '/admin/enforcement', 'Enforcement'],
   ];
   return `<!doctype html>
@@ -36,13 +32,13 @@ function adminLayout({ title, active, admin, flash, body }) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} · PCA Admin</title>
 <link rel="stylesheet" href="/assets/admin.css">
-<link rel="icon" href="data:image/svg+xml,${encodeURIComponent(LOGO_SVG)}">
+${FAVICON}
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="/admin">
+  <a class="brand" href="/admin" title="Parking Company of America — Admin">
     ${LOGO_SVG}
-    <span class="brand-name">Parking Company <span>of America</span></span>
+    <span class="brand-sub">Operations<br>Console</span>
   </a>
   <nav>
     ${nav.map(([key, href, label]) =>
@@ -71,16 +67,13 @@ function publicLayout({ title, body, extraHead = '' }) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} · Parking Company of America</title>
 <link rel="stylesheet" href="/assets/public.css">
-<link rel="icon" href="data:image/svg+xml,${encodeURIComponent(LOGO_SVG)}">
+${FAVICON}
 ${extraHead}
 </head>
 <body>
 <header class="pub-header">
-  ${LOGO_SVG}
-  <div>
-    <div class="pub-brand">Parking Company of America</div>
-    <div class="pub-tag">Easy parking. Scan. Pay. Done.</div>
-  </div>
+  <a href="/" aria-label="Parking Company of America home">${LOGO_SVG}</a>
+  <div class="pub-tag">Easy parking. Scan. Pay. Done.</div>
 </header>
 <main class="pub-main">
 ${body}

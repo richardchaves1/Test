@@ -10,6 +10,9 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
 
+// Stripe webhooks must see the raw body for signature verification, so this
+// runs before the JSON parser (body-parser skips routes already parsed).
+app.use('/webhooks/stripe', express.raw({ type: '*/*' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use('/assets', express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));

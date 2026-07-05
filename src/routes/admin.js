@@ -6,7 +6,8 @@ const { db } = require('../db');
 const { uniqueLocationCode } = require('../db');
 const { login, setSessionCookie, clearSessionCookie, requireAdmin } = require('../auth');
 const { esc, adminLayout, LOGO_SVG } = require('../views/layout');
-const { money } = require('../pricing');
+const { money, localToday } = require('../pricing');
+const stripe = require('../stripe');
 
 const router = express.Router();
 
@@ -59,7 +60,7 @@ router.get('/login', (req, res) => {
 <link rel="stylesheet" href="/assets/admin.css">
 </head><body class="login-body">
 <div class="login-card">
-  <div class="login-brand">${LOGO_SVG}<div><strong>Parking Company of America</strong><br><span class="muted">Operations Console</span></div></div>
+  <div class="login-brand">${LOGO_SVG}<div class="muted" style="text-align:center;margin-top:6px">Operations Console</div></div>
   ${req.query.err ? `<div class="flash flash-err">${esc(req.query.err)}</div>` : ''}
   <form method="post" action="/admin/login">
     <label>Email<input type="email" name="email" required autofocus placeholder="admin@parkwithpca.com"></label>
@@ -89,13 +90,18 @@ router.use(requireAdmin);
 
 router.get('/', (req, res) => {
   const now = new Date().toISOString();
+  const revenue = (where) => {
+    const s = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(total_amount),0) amt FROM sessions WHERE status='paid' AND ${where}`).get();
+    const p = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount),0) amt FROM passes WHERE status='paid' AND ${where}`).get();
+    return { n: s.n + p.n, amt: s.amt + p.amt };
+  };
   const stats = {
-    today: db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(total_amount),0) amt FROM sessions
-                       WHERE status='paid' AND date(created_at)=date('now')`).get(),
-    week: db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(total_amount),0) amt FROM sessions
-                      WHERE status='paid' AND created_at >= datetime('now','-7 days')`).get(),
-    all: db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(total_amount),0) amt FROM sessions WHERE status='paid'`).get(),
+    today: revenue("date(created_at)=date('now')"),
+    week: revenue("created_at >= datetime('now','-7 days')"),
+    all: revenue('1=1'),
     active: db.prepare(`SELECT COUNT(*) n FROM sessions WHERE status='paid' AND start_ts <= ? AND end_ts > ?`).get(now, now),
+    upcoming: db.prepare(`SELECT COUNT(*) n FROM sessions WHERE status='paid' AND kind='reservation' AND start_ts > ?`).get(now),
+    passes: db.prepare(`SELECT COUNT(*) n FROM passes WHERE status='paid' AND starts_on <= date('now') AND ends_on > date('now')`).get(),
   };
   const occupancy = db.prepare(`
     SELECT l.id, l.name, l.capacity, l.active,
@@ -109,11 +115,13 @@ router.get('/', (req, res) => {
     title: 'Dashboard', active: 'dashboard',
     body: `
 <h1>Dashboard</h1>
-<div class="stat-grid">
-  <div class="stat"><div class="stat-label">Revenue today</div><div class="stat-value">${money(stats.today.amt)}</div><div class="stat-sub">${stats.today.n} sessions</div></div>
-  <div class="stat"><div class="stat-label">Revenue (7 days)</div><div class="stat-value">${money(stats.week.amt)}</div><div class="stat-sub">${stats.week.n} sessions</div></div>
-  <div class="stat"><div class="stat-label">All-time revenue</div><div class="stat-value">${money(stats.all.amt)}</div><div class="stat-sub">${stats.all.n} sessions</div></div>
+<div class="stat-grid stat-grid-6">
+  <div class="stat"><div class="stat-label">Revenue today</div><div class="stat-value">${money(stats.today.amt)}</div><div class="stat-sub">${stats.today.n} payments</div></div>
+  <div class="stat"><div class="stat-label">Revenue (7 days)</div><div class="stat-value">${money(stats.week.amt)}</div><div class="stat-sub">${stats.week.n} payments</div></div>
+  <div class="stat"><div class="stat-label">All-time revenue</div><div class="stat-value">${money(stats.all.amt)}</div><div class="stat-sub">${stats.all.n} payments</div></div>
   <div class="stat"><div class="stat-label">Cars parked now</div><div class="stat-value">${stats.active.n}</div><div class="stat-sub">across ${occupancy.length} locations</div></div>
+  <div class="stat"><div class="stat-label">Upcoming reservations</div><div class="stat-value">${stats.upcoming.n}</div><div class="stat-sub">paid, not yet started</div></div>
+  <div class="stat"><div class="stat-label">Active monthly passes</div><div class="stat-value">${stats.passes.n}</div><div class="stat-sub"><a href="/admin/passes">manage →</a></div></div>
 </div>
 
 <div class="grid-2">
@@ -192,6 +200,7 @@ function locationForm(l = {}, action, submitLabel) {
   <label>ZIP<input name="zip" value="${esc(l.zip || '')}"></label>
   <label>Base hourly rate ($)<input name="hourly_rate" type="number" step="0.01" min="0" required value="${((l.hourly_rate ?? 300) / 100).toFixed(2)}"></label>
   <label>Daily maximum ($, 0 = none)<input name="daily_max" type="number" step="0.01" min="0" required value="${((l.daily_max ?? 2400) / 100).toFixed(2)}"></label>
+  <label>Monthly pass rate ($, 0 = not offered)<input name="monthly_rate" type="number" step="0.01" min="0" required value="${((l.monthly_rate ?? 0) / 100).toFixed(2)}"></label>
   <label>Timezone
     <select name="timezone">
       ${['America/New_York', 'America/Chicago', 'America/Denver', 'America/Phoenix', 'America/Los_Angeles']
@@ -223,6 +232,7 @@ function locationFromBody(body) {
     capacity: Math.max(1, parseInt(body.capacity, 10) || 1),
     hourly_rate: Math.max(0, Math.round(parseFloat(body.hourly_rate || '0') * 100)),
     daily_max: Math.max(0, Math.round(parseFloat(body.daily_max || '0') * 100)),
+    monthly_rate: Math.max(0, Math.round(parseFloat(body.monthly_rate || '0') * 100)),
     timezone: String(body.timezone || 'America/New_York'),
   };
 }
@@ -230,9 +240,9 @@ function locationFromBody(body) {
 router.post('/locations', (req, res) => {
   const l = locationFromBody(req.body);
   if (!l.name || !l.address) return res.redirect('/admin/locations/new?err=' + encodeURIComponent('Name and address are required.'));
-  const info = db.prepare(`INSERT INTO locations (code, name, address, city, state, zip, description, capacity, hourly_rate, daily_max, timezone)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(uniqueLocationCode(), l.name, l.address, l.city, l.state, l.zip, l.description, l.capacity, l.hourly_rate, l.daily_max, l.timezone);
+  const info = db.prepare(`INSERT INTO locations (code, name, address, city, state, zip, description, capacity, hourly_rate, daily_max, monthly_rate, timezone)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(uniqueLocationCode(), l.name, l.address, l.city, l.state, l.zip, l.description, l.capacity, l.hourly_rate, l.daily_max, l.monthly_rate, l.timezone);
   res.redirect(`/admin/locations/${info.lastInsertRowid}?ok=` + encodeURIComponent('Location created. Its QR code is ready below — print the sign and post it at the lot.'));
 });
 
@@ -295,8 +305,8 @@ router.post('/locations/:id', (req, res) => {
   const existing = db.prepare('SELECT id FROM locations WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).send('Location not found');
   const l = locationFromBody(req.body);
-  db.prepare(`UPDATE locations SET name=?, address=?, city=?, state=?, zip=?, description=?, capacity=?, hourly_rate=?, daily_max=?, timezone=? WHERE id=?`)
-    .run(l.name, l.address, l.city, l.state, l.zip, l.description, l.capacity, l.hourly_rate, l.daily_max, l.timezone, existing.id);
+  db.prepare(`UPDATE locations SET name=?, address=?, city=?, state=?, zip=?, description=?, capacity=?, hourly_rate=?, daily_max=?, monthly_rate=?, timezone=? WHERE id=?`)
+    .run(l.name, l.address, l.city, l.state, l.zip, l.description, l.capacity, l.hourly_rate, l.daily_max, l.monthly_rate, l.timezone, existing.id);
   res.redirect(`/admin/locations/${existing.id}?ok=` + encodeURIComponent('Location updated.'));
 });
 
@@ -310,7 +320,7 @@ router.get('/locations/:id/qr.png', async (req, res) => {
   if (!l) return res.status(404).send('Not found');
   const png = await QRCode.toBuffer(payUrl(req, l), {
     type: 'png', width: 600, margin: 2,
-    color: { dark: '#0b2545', light: '#ffffff' },
+    color: { dark: '#16233b', light: '#ffffff' },
   });
   res.type('png').send(png);
 });
@@ -320,7 +330,7 @@ router.get('/locations/:id/qr.svg', async (req, res) => {
   if (!l) return res.status(404).send('Not found');
   const svg = await QRCode.toString(payUrl(req, l), {
     type: 'svg', margin: 2,
-    color: { dark: '#0b2545', light: '#ffffff' },
+    color: { dark: '#16233b', light: '#ffffff' },
   });
   res.type('image/svg+xml').send(svg);
 });
@@ -330,7 +340,7 @@ router.get('/locations/:id/sign', async (req, res) => {
   const l = db.prepare('SELECT * FROM locations WHERE id = ?').get(req.params.id);
   if (!l) return res.status(404).send('Not found');
   const url = payUrl(req, l);
-  const qrSvg = await QRCode.toString(url, { type: 'svg', margin: 1, color: { dark: '#0b2545', light: '#ffffff' } });
+  const qrSvg = await QRCode.toString(url, { type: 'svg', margin: 1, color: { dark: '#16233b', light: '#ffffff' } });
   res.send(`<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -338,31 +348,27 @@ router.get('/locations/:id/sign', async (req, res) => {
 <style>
   * { box-sizing: border-box; margin: 0; }
   body { font-family: Arial, Helvetica, sans-serif; background: #e9edf2; display: flex; justify-content: center; padding: 24px; }
-  .sign { width: 720px; background: #fff; border: 6px solid #0b2545; border-radius: 18px; overflow: hidden; }
-  .sign-head { background: #0b2545; color: #fff; padding: 28px 32px; display: flex; align-items: center; gap: 16px; }
-  .sign-head .pca-logo { width: 56px; height: 56px; flex: none; }
-  .sign-head h1 { font-size: 26px; line-height: 1.2; }
-  .sign-head .sub { color: #c9d6e5; font-size: 15px; margin-top: 4px; }
-  .sign-body { padding: 32px; text-align: center; }
-  .sign-body h2 { font-size: 34px; color: #0b2545; }
+  .sign { width: 720px; background: #fff; border: 6px solid #1a5cdb; border-radius: 18px; overflow: hidden; }
+  .sign-head { padding: 30px 32px 8px; display: flex; justify-content: center; }
+  .sign-head .pca-logo { width: 360px; height: auto; }
+  .sign-body { padding: 8px 32px 28px; text-align: center; }
+  .sign-body h2 { font-size: 40px; color: #e8272b; letter-spacing: 0.03em; }
   .sign-body .loc { font-size: 20px; color: #444; margin-top: 6px; }
-  .qr-wrap { width: 340px; margin: 24px auto; padding: 16px; border: 4px solid #c8102e; border-radius: 14px; }
+  .qr-wrap { width: 330px; margin: 22px auto; padding: 16px; border: 4px solid #e8272b; border-radius: 14px; }
   .qr-wrap svg { width: 100%; height: auto; display: block; }
-  .steps { display: flex; justify-content: center; gap: 28px; margin: 8px 0 18px; color: #0b2545; font-weight: bold; font-size: 17px; }
+  .steps { display: flex; justify-content: center; gap: 24px; margin: 6px 0 18px; color: #16233b; font-weight: bold; font-size: 17px; }
   .steps span { background: #f2f5f9; border-radius: 999px; padding: 8px 18px; }
   .code { font-size: 15px; color: #666; }
-  .code strong { color: #0b2545; font-family: ui-monospace, monospace; }
-  .sign-foot { background: #c8102e; color: #fff; text-align: center; padding: 14px; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .code strong { color: #16233b; font-family: ui-monospace, monospace; }
+  .sign-foot { background: #1a5cdb; color: #fff; text-align: center; padding: 14px; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; }
   .toolbar { position: fixed; top: 12px; right: 12px; }
-  .toolbar button { padding: 10px 18px; font-size: 15px; border: 0; border-radius: 8px; background: #0b2545; color: #fff; cursor: pointer; }
+  .toolbar button { padding: 10px 18px; font-size: 15px; border: 0; border-radius: 8px; background: #1a5cdb; color: #fff; cursor: pointer; }
   @media print { body { background: #fff; padding: 0; } .toolbar { display: none; } .sign { border-radius: 0; width: 100%; } }
 </style>
 </head><body>
 <div class="toolbar"><button onclick="window.print()">Print</button></div>
 <div class="sign">
-  <div class="sign-head">${LOGO_SVG}
-    <div><h1>Parking Company of America</h1><div class="sub">Pay for parking in seconds — no app required</div></div>
-  </div>
+  <div class="sign-head">${LOGO_SVG}</div>
   <div class="sign-body">
     <h2>SCAN TO PAY</h2>
     <div class="loc">${esc(l.name)} · ${esc(l.address)}, ${esc(l.city)}, ${esc(l.state)}</div>
@@ -370,7 +376,7 @@ router.get('/locations/:id/sign', async (req, res) => {
     <div class="steps"><span>1 · Scan</span><span>2 · Enter plate</span><span>3 · Pay</span></div>
     <div class="code">No camera? Visit <strong>${esc(url.replace(/^https?:\/\//, ''))}</strong> · Location code <strong>${esc(l.code)}</strong></div>
   </div>
-  <div class="sign-foot">Rates from ${money(l.hourly_rate)}/hour · parkwithpca.com</div>
+  <div class="sign-foot">Rates from ${money(l.hourly_rate)}/hour${l.monthly_rate > 0 ? ` · Monthly passes ${money(l.monthly_rate)}` : ''} · parkwithpca.com</div>
 </div>
 </body></html>`);
 });
@@ -655,18 +661,18 @@ router.get('/transactions', (req, res) => {
 </form></div>
 <section class="card">
 <table>
-  <thead><tr><th>Ref</th><th>When</th><th>Location</th><th>Plate</th><th>Stay</th><th>Base</th><th>Discount</th><th>Total</th><th>Promo</th><th>Status</th><th></th></tr></thead>
+  <thead><tr><th>Ref</th><th>When</th><th>Location</th><th>Plate</th><th>Kind</th><th>Stay</th><th>Total</th><th>Promo</th><th>Method</th><th>Status</th><th></th></tr></thead>
   <tbody>
   ${rows.map((s) => `<tr>
     <td class="mono">${esc(s.ref)}</td>
     <td>${esc(s.created_at)}</td>
     <td>${esc(s.location_name)}</td>
     <td class="mono">${esc(s.plate)}</td>
+    <td>${s.kind === 'reservation' ? '<span class="pill pill-blue">reserve</span>' : 'drive-up'}</td>
     <td>${s.hours}h</td>
-    <td>${money(s.base_amount)}</td>
-    <td>${s.discount_amount ? `−${money(s.discount_amount)}` : '—'}</td>
-    <td><strong>${money(s.total_amount)}</strong></td>
+    <td><strong>${money(s.total_amount)}</strong>${s.discount_amount ? `<br><span class="muted">−${money(s.discount_amount)} promo</span>` : ''}</td>
     <td class="mono">${esc(s.promo_code || '—')}</td>
+    <td>${esc(s.payment_method)}</td>
     <td><span class="pill pill-${s.status === 'paid' ? 'ok' : 'off'}">${s.status}</span></td>
     <td>${s.status === 'paid' ? `<form method="post" action="/admin/transactions/${s.id}/refund" onsubmit="return confirm('Refund ${money(s.total_amount)} for ${esc(s.ref)}?')"><button class="btn btn-sm btn-ghost">Refund</button></form>` : ''}</td>
   </tr>`).join('') || '<tr><td colspan="11" class="muted">No transactions yet.</td></tr>'}
@@ -676,9 +682,68 @@ router.get('/transactions', (req, res) => {
   });
 });
 
-router.post('/transactions/:id/refund', (req, res) => {
-  db.prepare(`UPDATE sessions SET status = 'refunded' WHERE id = ? AND status = 'paid'`).run(req.params.id);
-  res.redirect('/admin/transactions?ok=' + encodeURIComponent('Session refunded.'));
+router.post('/transactions/:id/refund', async (req, res) => {
+  const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
+  if (!s || s.status !== 'paid') return res.redirect('/admin/transactions?err=' + encodeURIComponent('Session not found or not refundable.'));
+  if (s.payment_method === 'stripe' && s.stripe_payment_intent) {
+    try {
+      await stripe.refundPaymentIntent(s.stripe_payment_intent);
+    } catch (e) {
+      return res.redirect('/admin/transactions?err=' + encodeURIComponent(`Stripe refund failed: ${e.message}`));
+    }
+  }
+  db.prepare(`UPDATE sessions SET status = 'refunded' WHERE id = ? AND status = 'paid'`).run(s.id);
+  res.redirect('/admin/transactions?ok=' + encodeURIComponent(`Refunded ${money(s.total_amount)} (${s.ref}).`));
+});
+
+// ---------------- monthly passes ----------------
+
+router.get('/passes', (req, res) => {
+  const rows = db.prepare(`
+    SELECT p.*, l.name AS location_name, l.timezone FROM passes p JOIN locations l ON l.id = p.location_id
+    ORDER BY p.id DESC LIMIT 200`).all();
+  const activeCount = rows.filter((p) => p.status === 'paid' && p.starts_on <= localToday(p.timezone) && p.ends_on > localToday(p.timezone)).length;
+  page(req, res, {
+    title: 'Monthly passes', active: 'passes',
+    body: `
+<div class="page-head"><h1>Monthly passes</h1><span class="muted">${activeCount} active now · sold via each location's payment page</span></div>
+<section class="card">
+<table>
+  <thead><tr><th>Pass</th><th>Location</th><th>Holder</th><th>Plate</th><th>Valid</th><th>Amount</th><th>Method</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  ${rows.map((p) => {
+    const today = localToday(p.timezone);
+    const state = p.status !== 'paid' ? p.status : (p.starts_on > today ? 'upcoming' : (p.ends_on > today ? 'active' : 'expired'));
+    return `<tr>
+    <td class="mono">${esc(p.ref)}</td>
+    <td>${esc(p.location_name)}</td>
+    <td>${esc(p.holder_name)}${p.email ? `<br><span class="muted">${esc(p.email)}</span>` : ''}</td>
+    <td class="mono">${esc(p.plate)}</td>
+    <td>${esc(p.starts_on)} → ${esc(p.ends_on)}</td>
+    <td>${money(p.amount)}</td>
+    <td>${esc(p.payment_method)}</td>
+    <td><span class="pill pill-${state === 'active' ? 'ok' : (state === 'upcoming' ? 'blue' : 'off')}">${state}</span></td>
+    <td>${p.status === 'paid' ? `<form method="post" action="/admin/passes/${p.id}/refund" onsubmit="return confirm('Refund ${money(p.amount)} and revoke pass ${esc(p.ref)}?')"><button class="btn btn-sm btn-ghost">Refund</button></form>` : ''}</td>
+  </tr>`;
+  }).join('') || '<tr><td colspan="9" class="muted">No passes sold yet. Passes appear on a location\'s payment page once it has a monthly rate.</td></tr>'}
+  </tbody>
+</table>
+</section>`,
+  });
+});
+
+router.post('/passes/:id/refund', async (req, res) => {
+  const p = db.prepare('SELECT * FROM passes WHERE id = ?').get(req.params.id);
+  if (!p || p.status !== 'paid') return res.redirect('/admin/passes?err=' + encodeURIComponent('Pass not found or not refundable.'));
+  if (p.payment_method === 'stripe' && p.stripe_payment_intent) {
+    try {
+      await stripe.refundPaymentIntent(p.stripe_payment_intent);
+    } catch (e) {
+      return res.redirect('/admin/passes?err=' + encodeURIComponent(`Stripe refund failed: ${e.message}`));
+    }
+  }
+  db.prepare(`UPDATE passes SET status = 'refunded' WHERE id = ? AND status = 'paid'`).run(p.id);
+  res.redirect('/admin/passes?ok=' + encodeURIComponent(`Pass ${p.ref} refunded and revoked.`));
 });
 
 // ---------------- enforcement ----------------
@@ -686,6 +751,7 @@ router.post('/transactions/:id/refund', (req, res) => {
 router.get('/enforcement', (req, res) => {
   const plate = String(req.query.plate || '').trim().toUpperCase();
   let results = null;
+  let passes = [];
   if (plate) {
     const now = new Date().toISOString();
     results = db.prepare(`
@@ -694,7 +760,13 @@ router.get('/enforcement', (req, res) => {
       FROM sessions s JOIN locations l ON l.id = s.location_id
       WHERE UPPER(s.plate) = ? AND s.status = 'paid'
       ORDER BY s.end_ts DESC LIMIT 20`).all(now, now, plate);
+    passes = db.prepare(`
+      SELECT p.*, l.name AS location_name, l.timezone FROM passes p JOIN locations l ON l.id = p.location_id
+      WHERE UPPER(p.plate) = ? AND p.status = 'paid'
+      ORDER BY p.ends_on DESC LIMIT 10`).all(plate)
+      .map((p) => ({ ...p, is_active: p.starts_on <= localToday(p.timezone) && p.ends_on > localToday(p.timezone) ? 1 : 0 }));
   }
+  const anyPaid = results !== null && (results.some((r) => r.is_active) || passes.some((p) => p.is_active));
   page(req, res, {
     title: 'Enforcement', active: 'enforcement',
     body: `
@@ -704,20 +776,34 @@ router.get('/enforcement', (req, res) => {
     <input name="plate" value="${esc(plate)}" placeholder="License plate, e.g. ABC1234" required style="text-transform:uppercase">
     <button class="btn btn-primary" type="submit">Check plate</button>
   </form>
-  ${results === null ? '<p class="muted">Enter a plate to see whether it has an active paid session.</p>' : `
-  ${results.some((r) => r.is_active)
-    ? '<div class="flash flash-ok">✅ PAID — this vehicle has an active session.</div>'
-    : '<div class="flash flash-err">🚫 NOT PAID — no active session found for this plate.</div>'}
+  ${results === null ? '<p class="muted">Enter a plate to see whether it has an active paid session or monthly pass.</p>' : `
+  ${anyPaid
+    ? `<div class="flash flash-ok">✅ PAID — this vehicle has an active ${passes.some((p) => p.is_active) ? 'monthly pass' : 'session'}.</div>`
+    : '<div class="flash flash-err">🚫 NOT PAID — no active session or pass found for this plate.</div>'}
+  ${passes.length ? `
+  <h2>Monthly passes</h2>
   <table>
-    <thead><tr><th>Ref</th><th>Location</th><th>Valid from</th><th>Valid until</th><th>Total</th><th>Active</th></tr></thead>
+    <thead><tr><th>Pass</th><th>Location</th><th>Holder</th><th>Valid</th><th>Status</th></tr></thead>
+    <tbody>
+    ${passes.map((p) => `<tr>
+      <td class="mono">${esc(p.ref)}</td><td>${esc(p.location_name)}</td><td>${esc(p.holder_name)}</td>
+      <td>${esc(p.starts_on)} → ${esc(p.ends_on)}</td>
+      <td>${p.is_active ? '<span class="pill pill-ok">active</span>' : '<span class="pill pill-off">inactive</span>'}</td>
+    </tr>`).join('')}
+    </tbody>
+  </table>` : ''}
+  <h2>Sessions &amp; reservations</h2>
+  <table>
+    <thead><tr><th>Ref</th><th>Location</th><th>Kind</th><th>Valid from</th><th>Valid until</th><th>Total</th><th>Active</th></tr></thead>
     <tbody>
     ${results.map((s) => `<tr>
       <td class="mono">${esc(s.ref)}</td><td>${esc(s.location_name)}</td>
+      <td>${s.kind === 'reservation' ? 'reservation' : 'drive-up'}</td>
       <td>${esc(s.start_ts.replace('T', ' ').slice(0, 16))} UTC</td>
       <td>${esc(s.end_ts.replace('T', ' ').slice(0, 16))} UTC</td>
       <td>${money(s.total_amount)}</td>
-      <td>${s.is_active ? '<span class="pill pill-ok">active</span>' : '<span class="pill pill-off">expired</span>'}</td>
-    </tr>`).join('') || '<tr><td colspan="6" class="muted">No paid sessions for this plate.</td></tr>'}
+      <td>${s.is_active ? '<span class="pill pill-ok">active</span>' : '<span class="pill pill-off">not active</span>'}</td>
+    </tr>`).join('') || '<tr><td colspan="7" class="muted">No paid sessions for this plate.</td></tr>'}
     </tbody>
   </table>`}
 </section>`,
