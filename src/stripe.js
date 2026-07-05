@@ -66,6 +66,9 @@ async function createCheckoutSession({ productName, description, amountCents, re
     mode: 'payment',
     success_url: successUrl,
     cancel_url: cancelUrl,
+    // Expire quickly (Stripe minimum is 30 min) so an abandoned checkout can't
+    // be paid long after its capacity hold has lapsed.
+    expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
     client_reference_id: ref,
     ...(customerEmail ? { customer_email: customerEmail } : {}),
     line_items: [{

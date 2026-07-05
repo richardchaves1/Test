@@ -39,7 +39,7 @@ h2:first-child { margin-top: 0; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.95em; }
 
 /* cards & grids */
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 22px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 22px; overflow-x: auto; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
 @media (max-width: 980px) { .grid-2 { grid-template-columns: 1fr; } }
 

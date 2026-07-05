@@ -6,7 +6,7 @@ const { db } = require('../db');
 const { uniqueLocationCode } = require('../db');
 const { login, setSessionCookie, clearSessionCookie, requireAdmin } = require('../auth');
 const { esc, adminLayout, LOGO_SVG } = require('../views/layout');
-const { money, localToday } = require('../pricing');
+const { money, localToday, inclusiveEnd } = require('../pricing');
 const stripe = require('../stripe');
 
 const router = express.Router();
@@ -74,7 +74,7 @@ router.get('/login', (req, res) => {
 router.post('/login', (req, res) => {
   const user = login(req.body.email, req.body.password);
   if (!user) return res.redirect('/admin/login?err=' + encodeURIComponent('Invalid email or password.'));
-  setSessionCookie(res, user);
+  setSessionCookie(req, res, user);
   res.redirect('/admin');
 });
 
@@ -101,7 +101,11 @@ router.get('/', (req, res) => {
     all: revenue('1=1'),
     active: db.prepare(`SELECT COUNT(*) n FROM sessions WHERE status='paid' AND start_ts <= ? AND end_ts > ?`).get(now, now),
     upcoming: db.prepare(`SELECT COUNT(*) n FROM sessions WHERE status='paid' AND kind='reservation' AND start_ts > ?`).get(now),
-    passes: db.prepare(`SELECT COUNT(*) n FROM passes WHERE status='paid' AND starts_on <= date('now') AND ends_on > date('now')`).get(),
+    // pass dates are location-local, so "today" must be evaluated per location
+    passes: {
+      n: db.prepare(`SELECT p.starts_on, p.ends_on, l.timezone FROM passes p JOIN locations l ON l.id = p.location_id WHERE p.status='paid'`)
+        .all().filter((p) => { const t = localToday(p.timezone); return p.starts_on <= t && p.ends_on > t; }).length,
+    },
   };
   const occupancy = db.prepare(`
     SELECT l.id, l.name, l.capacity, l.active,
@@ -583,7 +587,7 @@ router.get('/campaigns/:id', (req, res) => {
   const stats = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(total_amount),0) revenue, COALESCE(SUM(discount_amount),0) discount
     FROM sessions WHERE campaign_id = ? AND status='paid'`).get(c.id);
   const recent = db.prepare(`SELECT s.*, l.name AS location_name FROM sessions s JOIN locations l ON l.id = s.location_id
-    WHERE s.campaign_id = ? ORDER BY s.id DESC LIMIT 15`).all(c.id);
+    WHERE s.campaign_id = ? AND s.status = 'paid' ORDER BY s.id DESC LIMIT 15`).all(c.id);
   const discountLabel = c.promo_code
     ? (c.discount_type === 'percent' ? `${c.discount_value}% off` : `${money(Math.round(c.discount_value))} off`)
     : null;
@@ -692,7 +696,10 @@ router.post('/transactions/:id/refund', async (req, res) => {
       return res.redirect('/admin/transactions?err=' + encodeURIComponent(`Stripe refund failed: ${e.message}`));
     }
   }
-  db.prepare(`UPDATE sessions SET status = 'refunded' WHERE id = ? AND status = 'paid'`).run(s.id);
+  const updated = db.prepare(`UPDATE sessions SET status = 'refunded' WHERE id = ? AND status = 'paid'`).run(s.id);
+  if (updated.changes === 1 && s.campaign_id) {
+    db.prepare('UPDATE campaigns SET redemptions = max(redemptions - 1, 0) WHERE id = ?').run(s.campaign_id);
+  }
   res.redirect('/admin/transactions?ok=' + encodeURIComponent(`Refunded ${money(s.total_amount)} (${s.ref}).`));
 });
 
@@ -719,7 +726,7 @@ router.get('/passes', (req, res) => {
     <td>${esc(p.location_name)}</td>
     <td>${esc(p.holder_name)}${p.email ? `<br><span class="muted">${esc(p.email)}</span>` : ''}</td>
     <td class="mono">${esc(p.plate)}</td>
-    <td>${esc(p.starts_on)} → ${esc(p.ends_on)}</td>
+    <td>${esc(p.starts_on)} → ${esc(inclusiveEnd(p.ends_on))}</td>
     <td>${money(p.amount)}</td>
     <td>${esc(p.payment_method)}</td>
     <td><span class="pill pill-${state === 'active' ? 'ok' : (state === 'upcoming' ? 'blue' : 'off')}">${state}</span></td>
@@ -787,7 +794,7 @@ router.get('/enforcement', (req, res) => {
     <tbody>
     ${passes.map((p) => `<tr>
       <td class="mono">${esc(p.ref)}</td><td>${esc(p.location_name)}</td><td>${esc(p.holder_name)}</td>
-      <td>${esc(p.starts_on)} → ${esc(p.ends_on)}</td>
+      <td>${esc(p.starts_on)} → ${esc(inclusiveEnd(p.ends_on))}</td>
       <td>${p.is_active ? '<span class="pill pill-ok">active</span>' : '<span class="pill pill-off">inactive</span>'}</td>
     </tr>`).join('')}
     </tbody>

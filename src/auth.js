@@ -61,9 +61,11 @@ function login(email, password) {
   return user;
 }
 
-function setSessionCookie(res, user) {
+function setSessionCookie(req, res, user) {
   const token = sign({ uid: user.id, email: user.email, name: user.name, exp: Math.floor(Date.now() / 1000) + MAX_AGE_S });
-  res.setHeader('Set-Cookie', `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${MAX_AGE_S}`);
+  const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  res.setHeader('Set-Cookie',
+    `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${MAX_AGE_S}${secure ? '; Secure' : ''}`);
 }
 
 function clearSessionCookie(res) {

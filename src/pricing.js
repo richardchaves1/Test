@@ -49,7 +49,19 @@ function zonedTimeToUtc(dateStr, timeStr, timeZone) {
   const wall = Date.UTC(y, m - 1, d, hh, mm);
   let utc = wall;
   for (let i = 0; i < 2; i++) utc = wall - tzOffsetMs(utc, timeZone);
+  // Nonexistent wall time (spring-forward gap): the round trip lands an hour
+  // early — shift forward so the stay never starts before the requested time.
+  const check = localParts(new Date(utc), timeZone);
+  if (check.date !== String(dateStr) || check.minutes !== hh * 60 + mm) {
+    utc += 3600_000;
+  }
   return new Date(utc);
+}
+
+/** Inclusive display form of an exclusive end date (the day before). */
+function inclusiveEnd(dateStr) {
+  const [y, m, d] = String(dateStr).split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
 }
 
 /** Today's date (YYYY-MM-DD) in a timezone. */
@@ -83,7 +95,10 @@ function ruleMatchesInstant(rule, parts) {
   if (!days.includes(parts.dow)) return false;
   const start = parseHHMM(rule.start_time);
   const end = parseHHMM(rule.end_time);
-  if (!(parts.minutes >= start && parts.minutes < end)) return false;
+  const inWindow = start <= end
+    ? parts.minutes >= start && parts.minutes < end
+    : parts.minutes >= start || parts.minutes < end; // overnight window, e.g. 22:00–06:00
+  if (!inWindow) return false;
   if (rule.start_date && parts.date < rule.start_date) return false;
   if (rule.end_date && parts.date > rule.end_date) return false;
   return true;
@@ -108,12 +123,15 @@ function quote(location, startDate, hours, promoCode) {
 
   let baseAmount = null;
 
-  // 1) Flat rules keyed off the stay start time (early bird, evening flat...)
+  // 1) Flat rules keyed off the stay start time (early bird, evening flat...).
+  //    "Highest priority wins": a flat rule only applies if no matching
+  //    override/multiplier rule outranks it at the stay start.
   const flat = rules.find((r) =>
     r.rule_type === 'flat' &&
     ruleMatchesInstant(r, startParts) &&
     (r.max_hours == null || hours <= r.max_hours));
-  if (flat) {
+  const topHourly = rules.find((r) => r.rule_type !== 'flat' && ruleMatchesInstant(r, startParts));
+  if (flat && (!topHourly || flat.priority >= topHourly.priority)) {
     baseAmount = Math.round(flat.value);
     notes.push(`Flat rate applied: ${flat.name}`);
   }
@@ -163,6 +181,11 @@ function quote(location, startDate, hours, promoCode) {
         ? Math.round(baseAmount * (c.discount_value / 100))
         : Math.round(c.discount_value);
       discountAmount = Math.min(discountAmount, baseAmount);
+      // Card networks can't charge less than $0.50 — waive sub-minimum remainders.
+      if (discountAmount > 0 && baseAmount - discountAmount > 0 && baseAmount - discountAmount < 50) {
+        discountAmount = baseAmount;
+        notes.push('Remainder under $0.50 waived');
+      }
       campaignId = c.id;
       appliedPromo = c.promo_code;
       notes.push(`Promo ${c.promo_code} applied (${c.discount_type === 'percent' ? `${c.discount_value}% off` : `$${(c.discount_value / 100).toFixed(2)} off`})`);
@@ -184,4 +207,4 @@ function money(cents) {
   return `$${(cents / 100).toFixed(2)}`;
 }
 
-module.exports = { quote, money, localParts, zonedTimeToUtc, localToday, addOneMonth };
+module.exports = { quote, money, localParts, zonedTimeToUtc, localToday, addOneMonth, inclusiveEnd };

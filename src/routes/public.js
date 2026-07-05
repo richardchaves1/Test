@@ -3,7 +3,7 @@
 const express = require('express');
 const { db, newReceiptRef } = require('../db');
 const { esc, publicLayout } = require('../views/layout');
-const { quote, money, zonedTimeToUtc, localToday, addOneMonth } = require('../pricing');
+const { quote, money, localParts, zonedTimeToUtc, localToday, addOneMonth, inclusiveEnd } = require('../pricing');
 const stripe = require('../stripe');
 
 const router = express.Router();
@@ -34,6 +34,22 @@ function overlappingCount(locationId, startIso, endIso) {
 
 function spotsLeft(location, startIso, endIso) {
   return location.capacity - overlappingCount(location.id, startIso, endIso);
+}
+
+/**
+ * Count a promo redemption, never exceeding the campaign's cap (the cap was
+ * checked at quote time, but payment can land later — e.g. Stripe checkout).
+ */
+function countRedemption(campaignId) {
+  if (!campaignId) return;
+  db.prepare(`UPDATE campaigns SET redemptions = redemptions + 1
+              WHERE id = ? AND (max_redemptions IS NULL OR redemptions < max_redemptions)`).run(campaignId);
+}
+
+/** Give a redemption back when a counted (paid) session is refunded. */
+function releaseRedemption(campaignId) {
+  if (!campaignId) return;
+  db.prepare('UPDATE campaigns SET redemptions = max(redemptions - 1, 0) WHERE id = ?').run(campaignId);
 }
 
 /** Resolve the requested stay start. mode 'reserve' reads local date/time fields. */
@@ -95,6 +111,10 @@ router.get('/p/:code', (req, res) => {
   const durations = [1, 2, 3, 4, 6, 8, 12, 24];
   const today = localToday(l.timezone);
   const maxDate = new Date(Date.now() + 90 * 86400_000).toISOString().slice(0, 10);
+  const maxPassDate = new Date(Date.now() + 60 * 86400_000).toISOString().slice(0, 10);
+  // Default reservation start: half an hour from now (location time), rounded up to :00/:30.
+  const soon = localParts(new Date(Math.ceil((Date.now() + 30 * 60_000) / (30 * 60_000)) * 30 * 60_000), l.timezone);
+  const defaultTime = `${String(Math.floor(soon.minutes / 60)).padStart(2, '0')}:${String(soon.minutes % 60).padStart(2, '0')}`;
   const err = req.query.err ? `<div class="quote-err" style="margin-bottom:14px">${esc(req.query.err)}</div>` : '';
 
   const cardFields = stripeMode ? '' : `
@@ -126,6 +146,7 @@ router.get('/p/:code', (req, res) => {
       <div class="quote-row quote-total"><span>Total due</span><span data-q="total">—</span></div>
       <div class="quote-notes" data-q="notes"></div>
       <div class="quote-err hidden" data-q="err"></div>
+      <input type="hidden" name="expected_total" data-q="expected">
     </div>`;
 
   res.send(publicLayout({
@@ -166,8 +187,8 @@ router.get('/p/:code', (req, res) => {
     <input type="hidden" name="mode" value="reserve">
     <h2>When do you arrive?</h2>
     <div class="card-row">
-      <label>Date<input name="start_date" type="date" required value="${today}" min="${today}" max="${maxDate}"></label>
-      <label>Time<input name="start_time" type="time" required value="10:00"></label>
+      <label>Date<input name="start_date" type="date" required value="${soon.date}" min="${today}" max="${maxDate}"></label>
+      <label>Time<input name="start_time" type="time" required value="${defaultTime}"></label>
     </div>
     <h2>How long will you stay?</h2>
     ${durationGrid('reserve')}
@@ -190,7 +211,7 @@ router.get('/p/:code', (req, res) => {
     <label>Full name<input name="holder_name" required placeholder="Jane Driver"></label>
     <label>License plate<input name="plate" required maxlength="10" placeholder="ABC1234" style="text-transform:uppercase" autocomplete="off"></label>
     <label>Email <span class="opt">(for your pass &amp; renewals)</span><input name="email" type="email" required placeholder="you@example.com"></label>
-    <label>Start date<input name="start_date" type="date" required value="${today}" min="${today}"></label>
+    <label>Start date<input name="start_date" type="date" required value="${today}" min="${today}" max="${maxPassDate}"></label>
     <div class="quote-box">
       <div class="quote-row quote-total"><span>Total due today</span><span>${money(l.monthly_rate)}</span></div>
       <div class="quote-notes">Covers one month from your start date. Renew from your pass page.</div>
@@ -232,6 +253,7 @@ router.get('/p/:code', (req, res) => {
         el('base').textContent = q.baseFormatted;
         el('total').textContent = q.totalFormatted;
         el('btn-total').textContent = q.totalFormatted;
+        el('expected').value = q.totalAmount;
         if (q.discountAmount > 0) { el('discount-row').classList.remove('hidden'); el('discount').textContent = '−' + q.discountFormatted; }
         else el('discount-row').classList.add('hidden');
         const notes = (q.notes || []).slice();
@@ -330,11 +352,27 @@ router.post('/p/:code/checkout', async (req, res, next) => {
     const q = quote(l, start, hours, req.body.promo);
     if (req.body.promo && String(req.body.promo).trim() && q.promoError) return payFail(res, l, q.promoError);
 
+    // If the price moved since the quote the driver saw (rate boundary crossed,
+    // promo cap reached), send them back to review rather than charging silently.
+    if (req.body.expected_total !== undefined && req.body.expected_total !== ''
+        && Number(req.body.expected_total) !== q.totalAmount) {
+      return payFail(res, l, `The price is now ${money(q.totalAmount)} (it changed since your quote) — please review and try again.`);
+    }
+
     const ref = newReceiptRef();
     const insert = db.prepare(`INSERT INTO sessions
       (ref, location_id, plate, email, kind, start_ts, end_ts, hours, base_amount, discount_amount,
        total_amount, promo_code, campaign_id, payment_method, status, stripe_session_id, pricing_notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+
+    // Fully discounted stay: nothing to charge, record it directly.
+    if (q.totalAmount === 0) {
+      insert.run(ref, l.id, plate, email, kind, start.toISOString(), end.toISOString(), hours,
+        q.baseAmount, q.discountAmount, 0, q.promoCode, q.campaignId,
+        'comp', 'paid', null, q.notes.join('; '));
+      countRedemption(q.campaignId);
+      return res.redirect(`/r/${ref}`);
+    }
 
     if (stripe.enabled()) {
       const label = kind === 'reservation'
@@ -350,6 +388,12 @@ router.post('/p/:code/checkout', async (req, res, next) => {
         cancelUrl: `${baseUrl(req)}/pay/cancelled?ref=${ref}`,
         customerEmail: email || undefined,
       });
+      // Re-check capacity after the await: another request may have taken the
+      // last spot while the Stripe call was in flight. The check and insert
+      // run in one synchronous block, so they can't interleave.
+      if (spotsLeft(l, start.toISOString(), end.toISOString()) <= 0) {
+        return payFail(res, l, 'Sorry — the last spot was taken while starting your checkout. Please try another time.');
+      }
       insert.run(ref, l.id, plate, email, kind, start.toISOString(), end.toISOString(), hours,
         q.baseAmount, q.discountAmount, q.totalAmount, q.promoCode, q.campaignId,
         'stripe', 'pending', checkout.id, q.notes.join('; '));
@@ -365,7 +409,7 @@ router.post('/p/:code/checkout', async (req, res, next) => {
     insert.run(ref, l.id, plate, email, kind, start.toISOString(), end.toISOString(), hours,
       q.baseAmount, q.discountAmount, q.totalAmount, q.promoCode, q.campaignId,
       'demo', 'paid', null, q.notes.join('; '));
-    if (q.campaignId) db.prepare('UPDATE campaigns SET redemptions = redemptions + 1 WHERE id = ?').run(q.campaignId);
+    countRedemption(q.campaignId);
     res.redirect(`/r/${ref}`);
   } catch (err) {
     next(err);
@@ -425,6 +469,14 @@ router.post('/p/:code/monthly', async (req, res, next) => {
   }
 });
 
+// NOTE: registered before /pass/:ref so "cancelled" isn't captured as a ref.
+router.get('/pass/cancelled', (req, res) => {
+  const p = db.prepare(`SELECT p.*, l.code AS location_code FROM passes p JOIN locations l ON l.id = p.location_id WHERE p.ref = ?`)
+    .get(String(req.query.ref || '').toUpperCase());
+  if (p && p.status === 'pending') db.prepare("UPDATE passes SET status = 'void' WHERE id = ? AND status = 'pending'").run(p.id);
+  cancelledPage(res, p ? `/p/${p.location_code}` : '/', 'pass');
+});
+
 // Pass page: status, period, renewal.
 router.get('/pass/:ref', (req, res) => {
   const p = db.prepare(`SELECT p.*, l.name AS location_name, l.address, l.city, l.state, l.timezone, l.monthly_rate, l.active AS location_active
@@ -453,14 +505,14 @@ router.get('/pass/:ref', (req, res) => {
     <dt>Holder</dt><dd>${esc(p.holder_name)}</dd>
     <dt>Plate</dt><dd class="mono">${esc(p.plate)}</dd>
     <dt>Valid from</dt><dd>${esc(p.starts_on)}</dd>
-    <dt>Valid until</dt><dd><strong>${esc(p.ends_on)}</strong></dd>
+    <dt>Valid through</dt><dd><strong>${esc(inclusiveEnd(p.ends_on))}</strong> (all day)</dd>
     <dt>Paid</dt><dd><strong>${money(p.amount)}</strong></dd>
   </dl>
   ${err}
   ${canRenew ? `
   <form method="post" action="/pass/${esc(p.ref)}/renew">
-    <h2 style="font-size:13px;color:#c8102e;text-transform:uppercase;letter-spacing:.07em;margin:18px 0 10px">Renew for another month</h2>
-    <p class="fine">Extends coverage from ${esc(p.ends_on)} for one month at ${money(p.monthly_rate)}.</p>
+    <h2 style="font-size:13px;color:#e8272b;text-transform:uppercase;letter-spacing:.07em;margin:18px 0 10px">Renew for another month</h2>
+    <p class="fine">Adds one month to this plate's coverage at ${money(p.monthly_rate)} — starting when your current coverage ends.</p>
     ${stripe.enabled() ? '' : `
     <div class="cardbox">
       <label>Card number<input name="card_number" inputmode="numeric" required placeholder="4242 4242 4242 4242" maxlength="19"></label>
@@ -486,8 +538,13 @@ router.post('/pass/:ref/renew', async (req, res, next) => {
       return res.redirect(`/pass/${p ? p.ref : ''}?err=${encodeURIComponent('This pass can\'t be renewed online. Contact PCA support.')}`);
     }
 
+    // Anchor the renewal to the plate's LATEST paid coverage at this location
+    // (not this particular pass row), so renewing an old pass can't double-sell
+    // a month that a newer pass already covers.
     const today = localToday(p.timezone);
-    const startsOn = p.ends_on > today ? p.ends_on : today; // extend, or restart today if lapsed
+    const latestEnd = db.prepare(`SELECT MAX(ends_on) m FROM passes
+      WHERE location_id = ? AND plate = ? AND status = 'paid'`).get(p.location_id, p.plate).m;
+    const startsOn = latestEnd && latestEnd > today ? latestEnd : today;
     const endsOn = addOneMonth(startsOn);
     const ref = newReceiptRef();
     const insert = db.prepare(`INSERT INTO passes
@@ -524,8 +581,29 @@ router.post('/pass/:ref/renew', async (req, res, next) => {
 
 // ---------------- Stripe return, cancel, webhook ----------------
 
-/** Mark a pending Stripe checkout as paid (idempotent). Returns a redirect path or null. */
-function completeStripeCheckout(checkoutSession) {
+/**
+ * Refund a captured payment and mark the row refunded. Used when money arrives
+ * for a row we can no longer honor (checkout was cancelled locally, or the lot
+ * filled while the driver was paying). If the refund API call fails, the
+ * payment intent is still recorded so an operator can refund manually.
+ */
+async function refundOrphanedPayment(table, row, pi, reason) {
+  try {
+    if (pi) await stripe.refundPaymentIntent(pi);
+    db.prepare(`UPDATE ${table} SET status = 'refunded', stripe_payment_intent = ? WHERE id = ?`).run(pi, row.id);
+    console.warn(`[stripe] auto-refunded ${table} ${row.ref}: ${reason}`);
+  } catch (e) {
+    db.prepare(`UPDATE ${table} SET stripe_payment_intent = ? WHERE id = ?`).run(pi, row.id);
+    console.error(`[stripe] REFUND FAILED for ${table} ${row.ref} (${pi}): ${e.message} — refund manually in the Stripe dashboard`);
+  }
+}
+
+/**
+ * Reconcile a Stripe checkout that reports payment_status='paid' (idempotent —
+ * reached from both the driver's return trip and the webhook).
+ * Returns { path, err? } for a redirect, or null if the checkout is unknown.
+ */
+async function completeStripeCheckout(checkoutSession) {
   if (checkoutSession.payment_status !== 'paid') return null;
   const pi = typeof checkoutSession.payment_intent === 'string'
     ? checkoutSession.payment_intent
@@ -534,17 +612,38 @@ function completeStripeCheckout(checkoutSession) {
   const s = db.prepare('SELECT * FROM sessions WHERE stripe_session_id = ?').get(checkoutSession.id);
   if (s) {
     if (s.status === 'pending') {
-      db.prepare("UPDATE sessions SET status = 'paid', stripe_payment_intent = ? WHERE id = ? AND status = 'pending'").run(pi, s.id);
-      if (s.campaign_id) db.prepare('UPDATE campaigns SET redemptions = redemptions + 1 WHERE id = ?').run(s.campaign_id);
+      // The capacity hold may have lapsed while the driver was on Stripe's page —
+      // never flip to paid if honoring it would oversell the window.
+      const l = db.prepare('SELECT * FROM locations WHERE id = ?').get(s.location_id);
+      const othersOverlapping = db.prepare(`
+        SELECT COUNT(*) n FROM sessions
+        WHERE location_id = ? AND id != ?
+          AND (status = 'paid' OR (status = 'pending' AND created_at >= datetime('now','-30 minutes')))
+          AND start_ts < ? AND end_ts > ?`).get(s.location_id, s.id, s.end_ts, s.start_ts).n;
+      if (othersOverlapping >= l.capacity) {
+        await refundOrphanedPayment('sessions', s, pi, 'lot filled before payment completed');
+        return { path: `/r/${s.ref}`, err: 'The lot filled up while your payment was processing — your card has been refunded in full.' };
+      }
+      const updated = db.prepare("UPDATE sessions SET status = 'paid', stripe_payment_intent = ? WHERE id = ? AND status = 'pending'").run(pi, s.id);
+      if (updated.changes === 1) countRedemption(s.campaign_id);
+    } else if (s.status === 'void') {
+      // Checkout was cancelled locally but the driver paid the still-open Stripe
+      // page anyway — money arrived for a dead row, so send it straight back.
+      await refundOrphanedPayment('sessions', s, pi, 'payment landed on a cancelled checkout');
+      return { path: `/r/${s.ref}`, err: 'This checkout was cancelled, so your payment has been refunded in full. Start a new session if you still need parking.' };
     }
-    return `/r/${s.ref}`;
+    return { path: `/r/${s.ref}` };
   }
+
   const p = db.prepare('SELECT * FROM passes WHERE stripe_session_id = ?').get(checkoutSession.id);
   if (p) {
     if (p.status === 'pending') {
       db.prepare("UPDATE passes SET status = 'paid', stripe_payment_intent = ? WHERE id = ? AND status = 'pending'").run(pi, p.id);
+    } else if (p.status === 'void') {
+      await refundOrphanedPayment('passes', p, pi, 'payment landed on a cancelled pass checkout');
+      return { path: `/pass/${p.ref}`, err: 'This checkout was cancelled, so your payment has been refunded in full.' };
     }
-    return `/pass/${p.ref}`;
+    return { path: `/pass/${p.ref}` };
   }
   return null;
 }
@@ -553,8 +652,8 @@ router.get('/stripe/return', async (req, res, next) => {
   try {
     if (!stripe.enabled() || !req.query.cs) return res.redirect('/');
     const checkout = await stripe.getCheckoutSession(String(req.query.cs));
-    const dest = completeStripeCheckout(checkout);
-    if (dest) return res.redirect(dest);
+    const dest = await completeStripeCheckout(checkout);
+    if (dest) return res.redirect(dest.err ? `${dest.path}?err=${encodeURIComponent(dest.err)}` : dest.path);
     res.status(402).send(publicLayout({
       title: 'Payment incomplete',
       body: `<section class="pay-card"><h1>Payment not completed</h1>
@@ -582,29 +681,26 @@ router.get('/pay/cancelled', (req, res) => {
   cancelledPage(res, s ? `/p/${s.location_code}` : '/', 'parking session');
 });
 
-router.get('/pass/cancelled', (req, res) => {
-  const p = db.prepare(`SELECT p.*, l.code AS location_code FROM passes p JOIN locations l ON l.id = p.location_id WHERE p.ref = ?`)
-    .get(String(req.query.ref || '').toUpperCase());
-  if (p && p.status === 'pending') db.prepare("UPDATE passes SET status = 'void' WHERE id = ? AND status = 'pending'").run(p.id);
-  cancelledPage(res, p ? `/p/${p.location_code}` : '/', 'pass');
-});
-
 // Webhook backstop: completes payment even if the driver never returns from Stripe.
 // Mounted with express.raw() in server.js so the signature can be verified.
-router.post('/webhooks/stripe', (req, res) => {
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret) return res.status(400).json({ error: 'STRIPE_WEBHOOK_SECRET not configured' });
-  const event = stripe.verifyWebhook(req.body, req.headers['stripe-signature'], secret);
-  if (!event) return res.status(400).json({ error: 'Invalid signature' });
+router.post('/webhooks/stripe', async (req, res, next) => {
+  try {
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!secret) return res.status(400).json({ error: 'STRIPE_WEBHOOK_SECRET not configured' });
+    const event = stripe.verifyWebhook(req.body, req.headers['stripe-signature'], secret);
+    if (!event) return res.status(400).json({ error: 'Invalid signature' });
 
-  if (event.type === 'checkout.session.completed') {
-    completeStripeCheckout(event.data.object);
-  } else if (event.type === 'checkout.session.expired') {
-    const id = event.data.object.id;
-    db.prepare("UPDATE sessions SET status = 'void' WHERE stripe_session_id = ? AND status = 'pending'").run(id);
-    db.prepare("UPDATE passes SET status = 'void' WHERE stripe_session_id = ? AND status = 'pending'").run(id);
+    if (event.type === 'checkout.session.completed') {
+      await completeStripeCheckout(event.data.object);
+    } else if (event.type === 'checkout.session.expired') {
+      const id = event.data.object.id;
+      db.prepare("UPDATE sessions SET status = 'void' WHERE stripe_session_id = ? AND status = 'pending'").run(id);
+      db.prepare("UPDATE passes SET status = 'void' WHERE stripe_session_id = ? AND status = 'pending'").run(id);
+    }
+    res.json({ received: true });
+  } catch (err) {
+    next(err);
   }
-  res.json({ received: true });
 });
 
 // ---------------- receipt / reservation management ----------------
@@ -668,7 +764,8 @@ router.post('/r/:ref/cancel', async (req, res, next) => {
         return res.redirect(`/r/${s.ref}?err=${encodeURIComponent(`Refund failed: ${e.message}. Please contact PCA support.`)}`);
       }
     }
-    db.prepare("UPDATE sessions SET status = 'refunded' WHERE id = ? AND status = 'paid'").run(s.id);
+    const updated = db.prepare("UPDATE sessions SET status = 'refunded' WHERE id = ? AND status = 'paid'").run(s.id);
+    if (updated.changes === 1) releaseRedemption(s.campaign_id);
     res.redirect(`/r/${s.ref}`);
   } catch (err) {
     next(err);
