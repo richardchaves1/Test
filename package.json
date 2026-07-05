@@ -1,0 +1,23 @@
+{
+  "name": "pca-parking-platform",
+  "version": "1.0.0",
+  "description": "Parking Company of America - parking sales, pricing, locations, QR payments, and marketing platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:41729/git/richardchaves1/Test"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4"
+  }
+}
