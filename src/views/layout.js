@@ -1,6 +1,6 @@
 'use strict';
 
-const { LOGO_SVG } = require('./logo');
+const { LOGO_HTML, FAVICON_HTML } = require('./logo');
 
 /** Escape a value for interpolation into HTML. */
 function esc(v) {
@@ -12,7 +12,7 @@ function esc(v) {
     .replaceAll("'", '&#39;');
 }
 
-const FAVICON = `<link rel="icon" href="data:image/svg+xml,${encodeURIComponent(LOGO_SVG)}">`;
+const FAVICON = FAVICON_HTML;
 
 /** Admin console page shell. */
 function adminLayout({ title, active, admin, flash, body }) {
@@ -37,7 +37,7 @@ ${FAVICON}
 <body>
 <header class="topbar">
   <a class="brand" href="/admin" title="Parking Company of America — Admin">
-    ${LOGO_SVG}
+    ${LOGO_HTML}
     <span class="brand-sub">Operations<br>Console</span>
   </a>
   <nav>
@@ -72,7 +72,7 @@ ${extraHead}
 </head>
 <body>
 <header class="pub-header">
-  <a href="/" aria-label="Parking Company of America home">${LOGO_SVG}</a>
+  <a href="/" aria-label="Parking Company of America home">${LOGO_HTML}</a>
   <div class="pub-tag">Easy parking. Scan. Pay. Done.</div>
 </header>
 <main class="pub-main">
@@ -83,4 +83,4 @@ ${body}
 </html>`;
 }
 
-module.exports = { esc, adminLayout, publicLayout, LOGO_SVG };
+module.exports = { esc, adminLayout, publicLayout, LOGO_HTML };

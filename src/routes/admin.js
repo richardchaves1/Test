@@ -5,7 +5,7 @@ const QRCode = require('qrcode');
 const { db } = require('../db');
 const { uniqueLocationCode } = require('../db');
 const { login, setSessionCookie, clearSessionCookie, requireAdmin } = require('../auth');
-const { esc, adminLayout, LOGO_SVG } = require('../views/layout');
+const { esc, adminLayout, LOGO_HTML } = require('../views/layout');
 const { money, localToday, inclusiveEnd } = require('../pricing');
 const stripe = require('../stripe');
 
@@ -58,9 +58,10 @@ router.get('/login', (req, res) => {
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in · PCA Admin</title>
 <link rel="stylesheet" href="/assets/admin.css">
+<link rel="icon" type="image/png" href="/assets/logo.png">
 </head><body class="login-body">
 <div class="login-card">
-  <div class="login-brand">${LOGO_SVG}<div class="muted" style="text-align:center;margin-top:6px">Operations Console</div></div>
+  <div class="login-brand">${LOGO_HTML}<div class="muted" style="text-align:center;margin-top:6px">Operations Console</div></div>
   ${req.query.err ? `<div class="flash flash-err">${esc(req.query.err)}</div>` : ''}
   <form method="post" action="/admin/login">
     <label>Email<input type="email" name="email" required autofocus placeholder="admin@parkwithpca.com"></label>
@@ -372,7 +373,7 @@ router.get('/locations/:id/sign', async (req, res) => {
 </head><body>
 <div class="toolbar"><button onclick="window.print()">Print</button></div>
 <div class="sign">
-  <div class="sign-head">${LOGO_SVG}</div>
+  <div class="sign-head">${LOGO_HTML}</div>
   <div class="sign-body">
     <h2>SCAN TO PAY</h2>
     <div class="loc">${esc(l.name)} · ${esc(l.address)}, ${esc(l.city)}, ${esc(l.state)}</div>

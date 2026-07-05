@@ -2,7 +2,9 @@
 
 A self-hosted parking sales and management platform for **Parking Company of America** — in the spirit of ParkMobile / SpotHero / ParkWhiz, but branded and operated by PCA.
 
-Drivers scan a **QR code posted at each location**, which opens that location's own mobile payment page. From there they can **park now**, **reserve a spot ahead of time**, or **buy a monthly pass** — no app required. Operators manage everything from a branded admin console. The PCA logo (US-map wordmark) is rendered as inline SVG so it stays crisp on every page, sign, and favicon.
+Drivers scan a **QR code posted at each location**, which opens that location's own mobile payment page. From there they can **park now**, **reserve a spot ahead of time**, or **buy a monthly pass** — no app required. Operators manage everything from a branded admin console.
+
+**Branding:** the PCA US-map logo lives at `public/logo.png` and is used on every page, printable sign, and favicon. To swap in updated brand art, just replace that one file — no code changes.
 
 ## Features
 
