@@ -1,0 +1,21 @@
+# Render.com blueprint — deploys the PCA Parking Platform on the free tier.
+# In Render: New + → Blueprint → connect this repo → pick the branch → Apply.
+services:
+  - type: web
+    name: pca-parking
+    runtime: node
+    plan: free
+    branch: claude/parking-company-platform-kp3zvr
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: '22.12.0'
+      # Set a strong admin password before sharing the URL with anyone.
+      - key: PCA_ADMIN_PASSWORD
+        generateValue: true
+      - key: PCA_SESSION_SECRET
+        generateValue: true
+    # Note: the free tier has an ephemeral disk — the SQLite database resets on
+    # each deploy/restart, which is fine for testing. For production, attach a
+    # persistent disk (paid plans) and set PCA_DATA_DIR to its mount path.
